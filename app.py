@@ -1,4 +1,4 @@
-
+# app.py
 from pathlib import Path
 import textwrap
 import pandas as pd
@@ -8,14 +8,14 @@ from dpwhlib.io import read_base_csv_from_path, save_csv_bytes
 from dpwhlib.flags import preprocess_projects, compute_project_flags_fast
 from dpwhlib.contractor import compute_contractor_indicators
 
-st.set_page_config(page_title="DPWH Flood-Control Screening (Projects + Contractors)", layout="wide")
+st.set_page_config(page_title="DPWH Flood-Control Audit", layout="wide")
 
 # ---------- Data path (bundled; no uploads) ----------
 DATA_DIR = Path(__file__).parent / "data"
 BASE_CSV = DATA_DIR / "Flood_Control_Data.csv"
 
-st.title("DPWH Flood-Control Audit ")
-st.caption("Rules-based screening using the bundled dataset; includes contractor indicators. No uploads required.")
+st.title("DPWH Flood-Control Audit")
+st.caption("Rules-based screening using the flood control data; includes contractor indicators.")
 
 with st.expander("How to read this dashboard"):
     st.markdown("""
@@ -43,12 +43,11 @@ if df.empty or df.columns.size == 0:
     st.error("The file was read but contains no columns/rows. Check delimiter and encoding (CSV may be ';' or tab).")
     st.stop()
 
-# ---------- Sidebar thresholds + explanations ----------
-st.sidebar.header("Flag Thresholds")
+# ---------- Sidebar: thresholds ----------
+st.sidebar.header("Project Flag Thresholds")
 redund_sim = st.sidebar.slider(
-    "Redundant: title similarity (0–1)", 0.40, 0.95, 0.60, step=0.01,
-    help="Projects in the SAME area & year are marked redundant if titles are ≥ this similarity. "
-         "Lower = more sensitive; higher = stricter."
+    "Redundant: title similarity (0–1)", 0.40, 0.95, 0.70, step=0.01,
+    help="Same area + same year; requires this similarity AND ≥2 uncommon tokens in common."
 )
 ghost_hi_pct = st.sidebar.slider(
     "Potential Ghost: 'high-amount' percentile", 50, 95, 75, step=1,
@@ -77,6 +76,55 @@ contr_cost_pctl = st.sidebar.slider(
     help="Flag if contractor mean ₱/km (or ₱/sq-km) ≥ this percentile vs. peers."
 )
 
+# ---------- Sidebar: column overrides & extra rules ----------
+st.sidebar.header("Columns (optional overrides)")
+cols = list(df.columns)
+def _sel(label): return st.sidebar.selectbox(label, ["(auto)"] + cols, index=0)
+
+title_col_sel = _sel("Project title")
+amount_col_sel = _sel("Amount / Contract cost")
+status_col_sel = _sel("Status or % complete")
+start_col_sel  = _sel("Start / NTP date")
+end_col_sel    = _sel("Completion date (actual)")
+target_col_sel = _sel("Target completion date")
+year_col_sel   = _sel("Year")
+region_col_sel = _sel("Region")
+prov_col_sel   = _sel("Province")
+city_col_sel   = _sel("City/Municipality")
+brgy_col_sel   = _sel("Barangay")
+contractor_col_sel = _sel("Contractor/Supplier")
+length_col_sel = _sel("Length (m/km)")
+area_col_sel   = _sel("Area (sqm/hectares)")
+
+st.sidebar.header("Extra rules")
+use_target_overrun = st.sidebar.checkbox(
+    "Use target-completion overrun rule", value=True,
+    help="If target completion exists, project not completed, and target+grace has passed → flag as potential ghost."
+)
+grace_days = st.sidebar.number_input(
+    "Grace days for target overrun", min_value=0, max_value=365, value=60, step=5,
+    help="Additional grace period after target completion before overrun is flagged."
+)
+
+col_overrides = {
+    k: (None if v == "(auto)" else v) for k, v in dict(
+        title=title_col_sel,
+        amount=amount_col_sel,
+        status=status_col_sel,
+        start=start_col_sel,
+        end=end_col_sel,
+        target=target_col_sel,
+        year=year_col_sel,
+        region=region_col_sel,
+        province=prov_col_sel,
+        city=city_col_sel,
+        barangay=brgy_col_sel,
+        contractor=contractor_col_sel,
+        length=length_col_sel,
+        area=area_col_sel
+    ).items()
+}
+
 with st.sidebar.expander(" About these thresholds"):
     st.markdown("""
 - **Sensitivity vs specificity:** Lower thresholds flag **more** items; higher thresholds flag **fewer** but stronger signals.  
@@ -87,12 +135,16 @@ with st.sidebar.expander(" About these thresholds"):
 
 # ---------- Cache heavy preprocessing ----------
 @st.cache_data(show_spinner=False)
-def _preprocess_once(df_input: pd.DataFrame):
-    return preprocess_projects(df_input)
+def _preprocess_once(df_input: pd.DataFrame, overrides: dict):
+    return preprocess_projects(df_input, overrides=overrides)
 
 with st.spinner("Preparing data (one-time)…"):
-    prep = _preprocess_once(df)
+    prep = _preprocess_once(df, col_overrides)
 prepped_df, colmap = prep["prepped"], prep["colmap"]
+
+# Show a tiny detection report
+with st.expander("Column detection (for transparency)"):
+    st.json(colmap)
 
 # ---------- Compute flags & indicators (fast) ----------
 with st.spinner("Computing screening indicators…"):
@@ -101,7 +153,9 @@ with st.spinner("Computing screening indicators…"):
         redundant_similarity=redund_sim,
         ghost_high_amount_percentile=ghost_hi_pct,
         never_ending_days=never_days,
-        cost_iqr_k=cost_iqr_k
+        cost_iqr_k=cost_iqr_k,
+        use_target_overrun=use_target_overrun,
+        grace_days=int(grace_days)
     )
     contr = compute_contractor_indicators(
         proj["annotated_full"],
@@ -131,71 +185,43 @@ t1, t2, t3, t4 = st.tabs([
 
 with t1:
     st.subheader("Project Flags")
+    # show reasons/labels to make review faster
+    cols_to_show = [
+        colmap.get("title") or "Title",
+        "FLAG_RedundantSameAreaYear","RedundantGroupID","Reason_Redundant",
+        "FLAG_PotentialGhost","Reason_PotentialGhost",
+        "FLAG_NeverEnding","Reason_NeverEnding",
+        "FLAG_Costly","Reason_Costly",
+        "CostRate","CostRateUnit","CostRatePercentile"
+    ]
     for key, label in [
         ("all_flagged", "All flagged projects"),
         ("redundant", "Redundant (same area + same year + similar titles)"),
-        ("ghost", "Potential ghost (status/date inconsistencies)"),
+        ("ghost", "Potential ghost (status/date inconsistencies & target overrun)"),
         ("neverending", "Never-ending (long duration or recurring titles)"),
         ("costly", "Costly (₱/km or ₱/sq-km outliers)")
     ]:
         dfv = proj.get(key, pd.DataFrame())
         st.caption(f"{label} — {len(dfv):,} rows")
-        st.dataframe(dfv.head(100), use_container_width=True)
+        show = [c for c in cols_to_show if c in dfv.columns]
+        st.dataframe((dfv[show] if show else dfv).head(150), use_container_width=True)
 
 with t2:
     st.subheader("Contractor Indicators")
-
     st.markdown("""
 These are **screening indicators** to prioritize review. They do **not** prove wrongdoing. 
 Use them to queue **document checks** (POW, plans/estimates, inspection, completion/acceptance) 
 and **site verification** before any conclusion.
     """)
-
     with st.expander("🔎 What the indicators mean"):
         st.markdown("""
-**a) Concentration (Share within an area–year)**  
-We compute, for each contractor, their **share of all projects** within the same area (Region/Province/City) and **year**.  
-A **high share** (e.g., ≥ 30%) may signal **reduced competition** → check bid histories (e.g., single-bidder cases).  
-*Legal anchor:* Procurement must be **competitive & transparent** under **RA 9184 / RA 12009 IRR**.
+**a) Concentration (Share within an area–year)** → competition risk screen.  
+**b) Repeated Issues** → count of ghost/never-ending/costly flags per contractor.  
+**c) Cost Outlier Rate** → fraction of contractor projects flagged as costly.  
+**d) High Mean Unit Cost** → contractor’s mean ₱/km or ₱/sq-km ≥ chosen peer percentile.
         """)
-        st.markdown("""
-**b) Repeated Issues (sum of flagged projects)**  
-Total of a contractor’s **Potential Ghost**, **Never-ending**, or **Costly** flags.  
-If the total crosses a threshold (e.g., **≥ 3**), it’s a **risk signal** for performance review and closer audit scrutiny.  
-*Legal anchor:* **PD 1445** (COA mandate) and **RA 9184** (sanctions/blacklisting) **after due process**.
-        """)
-        st.markdown("""
-**c) Cost Outlier Rate**  
-The **fraction** of a contractor’s projects flagged as **cost outliers** via **IQR**.  
-Persistent high rates suggest price reasonableness review (compare POW/estimates vs. outcomes).
-        """)
-        st.markdown("""
-**d) High Mean Unit Cost (peer comparison)**  
-Contractor’s mean ₱/km (or ₱/sq-km) compared with peers; ≥ chosen percentile (e.g., **90th**) is flagged.  
-Aligns with **Value for Money** principle in procurement; check terrain/scope context.
-        """)
-
-    with st.expander(" How the numbers are computed"):
-        st.markdown(f"""
-- **Concentration:** For each *area–year*, contractor share = (projects by contractor) ÷ (total projects).  
-  Flag if **max share** across area–years ≥ sidebar threshold (default **{contr_share:.0%}**).  
-- **Repeated Issues:** sum of **ghost + never-ending + costly**; flag if ≥ sidebar threshold (default **{contr_repeat}**).  
-- **Cost Outlier Rate:** (# **costly**) ÷ (total).  
-- **High Mean Unit Cost:** uses the **denser** metric (₱/km if length is more complete, else ₱/sq-km).  
-  Flag if contractor mean ≥ peer percentile (default **p{contr_cost_pctl}**).  
-- **Robust:** Uses **median/IQR**; thresholds are **transparent & tunable**.
-        """)
-
-    with st.expander(" Due process & safeguards"):
-        st.markdown("""
-- **Not a finding:** Indicators are **triage**. Any sanction requires **records + site validation** and **due process**.  
-- **Context matters:** High concentration can reflect **few qualified bidders**; high costs can reflect **difficult sites**.  
-- **Documentation:** Verify completion/acceptance, inspection reports, **ORS/BURS**, etc.  
-- **Data standards:** Adopt **PSGC** naming in future to improve grouping.
-        """)
-
     st.write("**Contractor Summary Table**")
-    st.dataframe(contr["contractor_table"].head(100), use_container_width=True)
+    st.dataframe(contr["contractor_table"].head(150), use_container_width=True)
 
 with t3:
     st.subheader("Download CSVs")
@@ -219,9 +245,8 @@ with t4:
     """)
     st.markdown(f"""
 **Data-Science Basis**  
-- **Redundant:** Title similarity ≥ **{redund_sim:.2f}** within same area & year.  
-- **Potential “Ghost”:** status/date logic; “high-amount” = top **{ghost_hi_pct}th** percentile of this dataset.  
+- **Redundant:** Same area & year; similarity ≥ **{redund_sim:.2f}** and ≥2 uncommon tokens in common.  
+- **Potential “Ghost”:** status/date logic; “high-amount” = top **{ghost_hi_pct}th** percentile; optional **target overrun** with {grace_days}-day grace.  
 - **Never-ending:** duration ≥ **{never_days}** days or recurring similar titles across ≥ 3 years in the same area.  
-- **Costly:** **IQR** outliers on ₱/km or ₱/sq-km (k = **{cost_iqr_k}**).  
-- **Contractor:** concentration, repeated flags, outlier rates, and high mean unit cost are **data-only indicators**.
+- **Costly:** **IQR** outliers on ₱/km or ₱/sq-km (k = **{cost_iqr_k}**), with explicit **CostRate** and unit.
     """)
