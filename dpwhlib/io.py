@@ -1,3 +1,4 @@
+
 from pathlib import Path
 import io, csv
 import pandas as pd
@@ -19,14 +20,12 @@ def read_base_csv_from_path(path: Path) -> pd.DataFrame:
       • Tries multiple encodings
       • Sniffs delimiter
       • Skips bad lines
-      • Falls back to read_excel if 'csv' parse fails
+      • Falls back to read_excel if CSV parse fails
     """
     if not path.exists() or path.stat().st_size == 0:
         raise ValueError(f"{path} is missing or empty.")
 
     raw = path.read_bytes()
-
-    # sniff delimiter from first ~32KB
     head_bytes = raw[:32768]
     try:
         head_text = head_bytes.decode("utf-8", errors="ignore")
@@ -37,17 +36,10 @@ def read_base_csv_from_path(path: Path) -> pd.DataFrame:
     last_err = None
     for enc in COMMON_ENCODINGS:
         try:
-            return pd.read_csv(
-                io.BytesIO(raw),
-                sep=sep,
-                engine="python",
-                encoding=enc,
-                on_bad_lines="skip"
-            )
+            return pd.read_csv(io.BytesIO(raw), sep=sep, engine="python", encoding=enc, on_bad_lines="skip")
         except Exception as e:
             last_err = e
 
-    # fallback: file might actually be Excel
     try:
         return pd.read_excel(io.BytesIO(raw))
     except Exception:
