@@ -1,3 +1,6 @@
+# dpwhlib/flags.py
+__FLAGSLIB_VERSION__ = "v2025-09-29c"
+
 import re
 import warnings
 import numpy as np
@@ -58,7 +61,7 @@ def _strip_generic_phrases(s: str) -> str:
     return s2
 
 # ----------------- stage 1: preprocess (cacheable) -----------------
-def preprocess_projects(df_raw: pd.DataFrame, overrides: dict | None = None) -> dict:
+def preprocess_projects(df_raw: pd.DataFrame, overrides: dict | None = None, geo_cell_km: float = 5.0) -> dict:
     df = df_raw.copy()
     cols = list(df.columns)
     overrides = overrides or {}
@@ -79,7 +82,11 @@ def preprocess_projects(df_raw: pd.DataFrame, overrides: dict | None = None) -> 
     len_cols = [overrides.get("length")] if overrides.get("length") else _find_cols_any(cols, r"(\blength\b|linear\s*(m|meter|metre|lm|km)|\bkm\b|\bm\b)")
     area_cols = [overrides.get("area")]   if overrides.get("area")   else _find_cols_any(cols, r"(area|sq.?km|sqm|m2|hect|ha)")
 
-    # Parse dates quietly
+    # NEW: latitude/longitude detection
+    lat_col = overrides.get("lat") or _find_col(cols, r"(lat|latitude|y[_\s]*coord)")
+    lon_col = overrides.get("lon") or _find_col(cols, r"(lon|long|lng|longitude|x[_\s]*coord)")
+
+    # Dates
     for c in [start_col, end_col, target_col]:
         if c:
             with warnings.catch_warnings():
@@ -101,13 +108,33 @@ def preprocess_projects(df_raw: pd.DataFrame, overrides: dict | None = None) -> 
     else:
         df["__Amount"] = np.nan
 
-    # Area key
-    loc_cols = [c for c in [region_col, province_col, city_col, barangay_col] if c]
-    if loc_cols:
-        df["__AreaKey"] = df[loc_cols].astype(str).agg(", ".join, axis=1).map(_norm_text)
+    # Area key (prefer geo grid if lat/lon present)
+    if lat_col and lon_col:
+        lat = pd.to_numeric(df[lat_col], errors="coerce")
+        lon = pd.to_numeric(df[lon_col], errors="coerce")
+        # degrees per km
+        lat_deg = geo_cell_km / 111.0
+        with np.errstate(invalid="ignore"):
+            lon_deg = geo_cell_km / (111.320 * np.cos(np.radians(lat.astype(float))))
+        lon_deg = pd.to_numeric(lon_deg, errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(lat_deg)
+
+        lat_bin = (lat / lat_deg).round().astype("Int64")
+        lon_bin = (lon / lon_deg).round().astype("Int64")
+        df["__AreaKey"] = (lat_bin.astype(str) + ":" + lon_bin.astype(str))
+        df["__AreaKeySource"] = "geo"
     else:
-        loc_guess = _find_col(cols, r"(location|site|river|barangay|place)")
-        df["__AreaKey"] = df[loc_guess].astype(str).map(_norm_text) if loc_guess else ""
+        loc_cols = [c for c in [region_col, province_col, city_col, barangay_col] if c]
+        if loc_cols:
+            df["__AreaKey"] = df[loc_cols].astype(str).agg(", ".join, axis=1).map(_norm_text)
+            df["__AreaKeySource"] = "admin_text"
+        else:
+            loc_guess = _find_col(cols, r"(location|site|river|barangay|place)")
+            if loc_guess:
+                df["__AreaKey"] = df[loc_guess].astype(str).map(_norm_text)
+                df["__AreaKeySource"] = "location_text"
+            else:
+                df["__AreaKey"] = ""
+                df["__AreaKeySource"] = "none"
 
     # Duration
     if start_col and end_col:
@@ -147,7 +174,7 @@ def preprocess_projects(df_raw: pd.DataFrame, overrides: dict | None = None) -> 
     df["__CostPerKm"]   = df.apply(lambda r: _safe_div(r["__Amount"], r["__LengthKm"]) if pd.notna(r["__LengthKm"]) else np.nan, axis=1)
     df["__CostPerSqKm"] = df.apply(lambda r: _safe_div(r["__Amount"], r["__AreaSqKm"]) if pd.notna(r["__AreaSqKm"]) else np.nan, axis=1)
 
-    # Try numeric "% complete"
+    # Numeric "% complete"
     if status_col:
         s = df[status_col].astype(str).str.extract(r"(\d{1,3}(?:\.\d+)?)")[0]
         df["__AccompPct"] = pd.to_numeric(s, errors="coerce").clip(0,100)
@@ -158,7 +185,8 @@ def preprocess_projects(df_raw: pd.DataFrame, overrides: dict | None = None) -> 
         "title": title_col, "amount": amount_col, "status": status_col,
         "start": start_col, "end": end_col, "target": target_col, "year": year_col,
         "region": region_col, "province": province_col, "city": city_col, "barangay": barangay_col,
-        "contractor": contractor_col, "length": length_col, "area": area_col
+        "contractor": contractor_col, "length": length_col, "area": area_col,
+        "lat": lat_col, "lon": lon_col, "geo_cell_km": geo_cell_km
     }
     return {"prepped": df, "colmap": colmap}
 
@@ -177,6 +205,7 @@ def _fast_redundant_flags_labeled(prepped: pd.DataFrame, title_col: str, similar
     gid = 0
     idx_all = list(prepped.index)
 
+    # Redundant: same area & same year
     for (_, _), sub in prepped.groupby(["__AreaKey", "__Year"], dropna=False):
         if len(sub) < 2:
             continue
@@ -191,7 +220,7 @@ def _fast_redundant_flags_labeled(prepped: pd.DataFrame, title_col: str, similar
         for i in range(len(idx)):
             row = mat[i]
             for j in range(len(idx)):
-                if j == i:
+                if j == i: 
                     continue
                 if row[j] >= thr:
                     common = toks[i].intersection(toks[j])
@@ -210,13 +239,11 @@ def _fast_redundant_flags_labeled(prepped: pd.DataFrame, title_col: str, similar
                         seen.add(v); comp.add(v); queue.append(v)
             if len(comp) >= 2:
                 gid += 1
-                comp_idx = [idx[k] for k in sorted(list(comp))]
                 for k in comp:
                     rowid = idx[k]
                     flags[idx_all.index(rowid)] = True
                     group_id.loc[rowid] = gid
-                    peer_titles = [titles[m] for m in comp if m != k]
-                    peers[idx_all.index(rowid)] = peer_titles
+                    peers[idx_all.index(rowid)] = [titles[m] for m in comp if m != k]
                     reasons[idx_all.index(rowid)] = f"Similar title(s) within same area-year; {len(comp)} in group"
     return pd.Series(flags, index=prepped.index), group_id, pd.Series(peers, index=prepped.index), pd.Series(reasons, index=prepped.index)
 
@@ -239,14 +266,14 @@ def compute_project_flags_fast(
     end_col     = colmap.get("end")
     target_col  = colmap.get("target")
 
-    # ---- Redundant (same area & same year) with labels ----
+    # ---- Redundant (same area & same year) ----
     rf, rgid, rpeers, rwhy = _fast_redundant_flags_labeled(df, title_col, redundant_similarity)
     df["FLAG_RedundantSameAreaYear"] = rf
     df["RedundantGroupID"] = rgid
     df["RedundantPeers"] = rpeers
     df["Reason_Redundant"] = rwhy
 
-    # ---- Potential Ghost (robust) ----
+    # ---- Potential Ghost ----
     amt_hi = np.nanpercentile(df["__Amount"].dropna(), ghost_high_amount_percentile) if df["__Amount"].notna().any() else np.nan
     status_vals = (df[status_col].astype(str).str.lower().str.strip() if status_col else pd.Series("", index=df.index))
     accomp = df["__AccompPct"]
@@ -290,12 +317,20 @@ def compute_project_flags_fast(
 
     # ---- Never-ending (long duration OR recurring multi-year) ----
     dur_ok = df["__DurationDays"].fillna(-1)
-    long_dur = dur_ok.ge(never_ending_days)
+    # Long duration requires both start & end dates to avoid mislabeling open projects
+    long_dur = (df.get("start") is not None and df.get("end") is not None) and dur_ok.ge(never_ending_days)
+
+    # Prolonged-open: only when not completed & very old start with no end (stricter)
+    strict_open_days = max(int(never_ending_days * 1.5), never_ending_days + 365)
+    prolonged_open = pd.Series(False, index=df.index)
+    if start_col and not end_col:
+        not_complete = ~completeish
+        age = (pd.Timestamp.now() - df[start_col]).dt.days
+        prolonged_open = not_complete & (age > strict_open_days)
 
     recurring = pd.Series(False, index=df.index)
     rec_reason = [""]*len(df)
     if title_col:
-        # FIX: group by a single key; do not unpack two values
         for _, sub in df.groupby("__AreaKey", dropna=False):
             if sub.shape[0] < 2:
                 continue
@@ -311,11 +346,14 @@ def compute_project_flags_fast(
                     recurring.loc[i] = True
                     rec_reason[list(df.index).index(i)] = f"Similar titles across {len(years)} years in same area"
 
-    df["FLAG_NeverEnding"] = (long_dur | recurring)
-    df["Reason_NeverEnding"] = np.where(long_dur, f"Duration ≥ {never_ending_days} days", "") + \
-                               np.where(recurring, "; " + pd.Series(rec_reason, index=df.index), "")
+    df["FLAG_NeverEnding"] = (pd.Series(long_dur, index=df.index) | prolonged_open | recurring)
+    df["Reason_NeverEnding"] = (
+        np.where(pd.Series(long_dur, index=df.index), f"Duration ≥ {never_ending_days} days (with end date)", "") +
+        np.where(prolonged_open, f"; Not completed & open > {strict_open_days} days", "") +
+        np.where(recurring, "; " + pd.Series(rec_reason, index=df.index), "")
+    )
 
-    # ---- Costly (explicit cost rate + unit + labels) ----
+    # ---- Costly (explicit cost rate + unit + labels, with fallback to Amount) ----
     def iqr_bounds(s: pd.Series, k=1.5):
         s2 = s.astype(float).replace([np.inf, -np.inf], np.nan).dropna()
         if s2.empty: return np.nan, np.nan
@@ -326,9 +364,16 @@ def compute_project_flags_fast(
             iqr = std if std > 0 else 1.0
         return (q1 - k*iqr, q3 + k*iqr)
 
-    use_km = df["__CostPerKm"].notna().sum() >= df["__CostPerSqKm"].notna().sum()
-    metric_name = "__CostPerKm" if use_km else "__CostPerSqKm"
-    unit = "₱/km" if use_km else "₱/sq-km"
+    # pick best metric available
+    n_km = df["__CostPerKm"].notna().sum()
+    n_sq = df["__CostPerSqKm"].notna().sum()
+    if n_km == 0 and n_sq == 0:
+        metric_name = "__Amount"
+        unit = "₱ (amount)"
+    else:
+        use_km = n_km >= n_sq
+        metric_name = "__CostPerKm" if use_km else "__CostPerSqKm"
+        unit = "₱/km" if use_km else "₱/sq-km"
 
     low_t, high_t = iqr_bounds(df[metric_name], k=cost_iqr_k)
     pct = df[metric_name].rank(pct=True)
@@ -379,7 +424,7 @@ def compute_project_flags(
     prep = preprocess_projects(df)
     return compute_project_flags_fast(
         prep["prepped"], prep["colmap"],
-        redundant_similarity=redundant_similarity,
+        redundant_similarity=redund_similarity,
         ghost_high_amount_percentile=ghost_high_amount_percentile,
         never_ending_days=never_ending_days,
         cost_iqr_k=cost_iqr_k,
