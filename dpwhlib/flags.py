@@ -270,3 +270,25 @@ def compute_project_flags_fast(
         })
     }
     return out
+
+# --- Backward-compat shim: keep old API name working ---
+def compute_project_flags(
+    df,
+    redundant_similarity=0.60,
+    ghost_high_amount_percentile=75,
+    never_ending_days=730,
+    cost_iqr_k=1.5
+):
+    """
+    Legacy wrapper for backward compatibility.
+    Runs the new two-stage pipeline under the hood.
+    """
+    prep = preprocess_projects(df)
+    return compute_project_flags_fast(
+        prep["prepped"],
+        prep["colmap"],
+        redundant_similarity=redundant_similarity,
+        ghost_high_amount_percentile=ghost_high_amount_percentile,
+        never_ending_days=never_ending_days,
+        cost_iqr_k=cost_iqr_k,
+    )
