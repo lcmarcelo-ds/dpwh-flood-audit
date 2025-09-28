@@ -14,13 +14,13 @@ st.set_page_config(page_title="DPWH Flood-Control Screening (Projects + Contract
 DATA_DIR = Path(__file__).parent / "data"
 BASE_CSV = DATA_DIR / "Flood_Control_Data.csv"
 
-st.title("DPWH Flood-Control Screening (Data-Only)")
+st.title("DPWH Flood-Control Audit")
 st.caption("Rules-based screening using the bundled dataset; includes contractor indicators. No uploads required.")
 
 with st.expander("How to read this dashboard"):
     st.markdown("""
 **What this is:** A *screening* tool to prioritize verification.  
-**What it uses:** Flood Control from DPWH and Sumbongsapangulo.ph/`.  
+**What it uses:** Flood Control from DPWH and Sumbongsapangulo.ph.  
 **What it shows:** Project-level flags (redundant, ghost, never-ending, costly) **and** contractor indicators (concentration, repeated issues, outlier rates).  
 **Not legal findings:** Always verify with records and site inspection before conclusions.
 """)
