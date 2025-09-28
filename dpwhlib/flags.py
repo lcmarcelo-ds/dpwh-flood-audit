@@ -1,4 +1,5 @@
 import re
+import warnings
 import numpy as np
 import pandas as pd
 from .textutils import norm_text, seq_ratio
@@ -52,16 +53,22 @@ def compute_project_flags(
 
     df = df.copy()
 
-    # parse dates
-    if start_col: df[start_col] = pd.to_datetime(df[start_col], errors="coerce")
-    if end_col:   df[end_col]   = pd.to_datetime(df[end_col], errors="coerce")
+    # Quiet mixed-date warnings and coerce invalids to NaT
+    if start_col:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            df[start_col] = pd.to_datetime(df[start_col], errors="coerce", format="mixed")
+    if end_col:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            df[end_col] = pd.to_datetime(df[end_col], errors="coerce", format="mixed")
 
-    # helper cols
+    # Helper cols
     df["__Year"] = df[year_col].apply(_extract_year).astype("Int64") if year_col else pd.Series(pd.NA, index=df.index, dtype="Int64")
     if df["__Year"].isna().all():
-        df["__Year"] = df[[c for c in [start_col, end_col] if c]].apply(
-            lambda r: r.dropna().iloc[0].year if r.dropna().shape[0]>0 else np.nan, axis=1
-        ).astype("Int64")
+        use = [c for c in [start_col, end_col] if c]
+        if use:
+            df["__Year"] = df[use].apply(lambda r: r.dropna().iloc[0].year if r.dropna().shape[0]>0 else np.nan, axis=1).astype("Int64")
 
     df["__Amount"] = (
         pd.to_numeric(df[amount_col].astype(str).str.replace(",","", regex=False), errors="coerce")
@@ -85,13 +92,14 @@ def compute_project_flags(
     df["__TitleNorm"] = df[title_col].astype(str).map(norm_text) if title_col else ""
     df["__ContractorNorm"] = df[contractor_col].astype(str).map(norm_text) if contractor_col else ""
 
-    # unit conversions
+    # Unit conversions
     length_col = len_cols[0] if len_cols else None
     area_col   = area_cols[0] if area_cols else None
 
     if length_col:
         xlen = pd.to_numeric(df[length_col].astype(str).str.replace(",","",regex=False), errors="coerce")
-        if xlen.dropna().median() > 1000: xlen = xlen/1000.0
+        if xlen.dropna().median() > 1000:
+            xlen = xlen/1000.0
         df["__LengthKm"] = xlen
     else:
         df["__LengthKm"] = np.nan
@@ -110,7 +118,7 @@ def compute_project_flags(
     df["__CostPerKm"]   = df.apply(lambda r: _safe_div(r["__Amount"], r["__LengthKm"]) if pd.notna(r["__LengthKm"]) else np.nan, axis=1)
     df["__CostPerSqKm"] = df.apply(lambda r: _safe_div(r["__Amount"], r["__AreaSqKm"]) if pd.notna(r["__AreaSqKm"]) else np.nan, axis=1)
 
-    # --- Redundant ---
+    # Redundant
     redundant_idx = set()
     if title_col:
         for (_, _), sub in df.groupby(["__AreaKey", "__Year"], dropna=False):
@@ -123,7 +131,7 @@ def compute_project_flags(
                         redundant_idx.add(idxs[i]); redundant_idx.add(idxs[j])
     df["FLAG_RedundantSameAreaYear"] = df.index.isin(redundant_idx)
 
-    # --- Potential Ghost ---
+    # Potential Ghost
     amt_hi = np.nanpercentile(df["__Amount"].dropna(), ghost_high_amount_percentile) if df["__Amount"].notna().any() else np.nan
     flags_g = []; reasons_g = []
     for _, r in df.iterrows():
@@ -143,7 +151,7 @@ def compute_project_flags(
     df["FLAG_PotentialGhost"] = flags_g
     df["Reason_PotentialGhost"] = reasons_g
 
-    # --- Never-ending ---
+    # Never-ending
     flags_n=[]; reasons_n=[]
     for _, r in df.iterrows():
         flag=False; reasons=[]
@@ -163,7 +171,7 @@ def compute_project_flags(
     df["FLAG_NeverEnding"] = flags_n
     df["Reason_NeverEnding"] = reasons_n
 
-    # --- Costly ---
+    # Costly (IQR)
     def iqr_flags(s: pd.Series, k=1.5):
         s = s.astype(float)
         s2 = s[~s.isna()]
