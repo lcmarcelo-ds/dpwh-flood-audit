@@ -1,4 +1,3 @@
-# dpwhlib/flags.py
 import re
 import warnings
 import numpy as np
@@ -192,7 +191,7 @@ def _fast_redundant_flags_labeled(prepped: pd.DataFrame, title_col: str, similar
         for i in range(len(idx)):
             row = mat[i]
             for j in range(len(idx)):
-                if j == i: 
+                if j == i:
                     continue
                 if row[j] >= thr:
                     common = toks[i].intersection(toks[j])
@@ -267,7 +266,7 @@ def compute_project_flags_fast(
     if use_target_overrun and target_col:
         tgt = df[target_col]
         past = tgt.notna() & ((pd.Timestamp.now() - tgt).dt.days > int(grace_days))
-        not_complete = ~completeish | ~has_end
+        not_complete = (~completeish) | (~has_end)
         overrun = past & not_complete
 
     ghost_flag = (
@@ -296,10 +295,12 @@ def compute_project_flags_fast(
     recurring = pd.Series(False, index=df.index)
     rec_reason = [""]*len(df)
     if title_col:
-        for (_, _), sub in df.groupby("__AreaKey", dropna=False):
-            if sub.empty: continue
+        # FIX: group by a single key; do not unpack two values
+        for _, sub in df.groupby("__AreaKey", dropna=False):
+            if sub.shape[0] < 2:
+                continue
             for i, r in sub.iterrows():
-                if pd.isna(r["__Year"]) or pd.isna(r[title_col]): 
+                if pd.isna(r["__Year"]) or pd.isna(r[title_col]):
                     continue
                 base = _strip_generic_phrases(str(r[title_col]))
                 sim = sub[sub[title_col].astype(str).apply(
