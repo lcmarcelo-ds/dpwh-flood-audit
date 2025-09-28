@@ -101,26 +101,6 @@ grace_days = st.sidebar.number_input(
     help="Additional grace period after target completion before overrun is flagged."
 )
 
-col_overrides = {
-    k: (None if v == "(auto)" else v) for k, v in dict(
-        title=title_col_sel,
-        amount=amount_col_sel,
-        status=status_col_sel,
-        start=start_col_sel,
-        end=end_col_sel,
-        target=target_col_sel,
-        year=year_col_sel,
-        region=region_col_sel,
-        province=prov_col_sel,
-        city=city_col_sel,
-        barangay=brgy_col_sel,
-        contractor=contractor_col_sel,
-        length=length_col_sel,
-        area=area_col_sel,
-        lat=lat_col_sel,
-        lon=lon_col_sel,
-    ).items()
-}
 
 with st.sidebar.expander(" How these thresholds work"):
     st.markdown(f"""
