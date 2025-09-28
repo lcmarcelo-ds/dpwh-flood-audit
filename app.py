@@ -5,22 +5,22 @@ import pandas as pd
 import streamlit as st
 
 from dpwhlib.io import read_base_csv_from_path, save_csv_bytes
-from dpwhlib.flags import compute_project_flags
+from dpwhlib.flags import preprocess_projects, compute_project_flags_fast
 from dpwhlib.contractor import compute_contractor_indicators
 
-st.set_page_config(page_title="DPWH Flood-Control Screening (Projects + Contractors)", layout="wide")
+st.set_page_config(page_title="DPWH Flood-Control Screening Audit", layout="wide")
 
 # ---------- Data path (bundled; no uploads) ----------
 DATA_DIR = Path(__file__).parent / "data"
 BASE_CSV = DATA_DIR / "Flood_Control_Data.csv"
 
-st.title("DPWH Flood-Control Audit")
+st.title("DPWH Flood-Control Screening (Data-Only)")
 st.caption("Rules-based screening using the bundled dataset; includes contractor indicators. No uploads required.")
 
 with st.expander("How to read this dashboard"):
     st.markdown("""
 **What this is:** A *screening* tool to prioritize verification.  
-**What it uses:** Flood Control from DPWH and Sumbongsapangulo.ph.  
+**What it uses:** Flood Data from DPWH Website and SumbongPangulo.ph.  
 **What it shows:** Project-level flags (redundant, ghost, never-ending, costly) **and** contractor indicators (concentration, repeated issues, outlier rates).  
 **Not legal findings:** Always verify with records and site inspection before conclusions.
 """)
@@ -44,22 +44,82 @@ if df.empty or df.columns.size == 0:
     st.error("The file was read but contains no columns/rows. Check delimiter and encoding (CSV may be ';' or tab).")
     st.stop()
 
-# ---------- Sidebar: transparent, tunable thresholds ----------
-st.sidebar.header("Project Flag Thresholds")
-redund_sim = st.sidebar.slider("Redundant: title similarity (0–1)", 0.40, 0.95, 0.60, step=0.01)
-ghost_hi_pct = st.sidebar.slider("Potential Ghost: 'high-amount' percentile", 50, 95, 75, step=1)
-never_days = st.sidebar.number_input("Never-ending: minimum days", min_value=365, max_value=1825, value=730, step=15)
-cost_iqr_k = st.sidebar.slider("Costly: IQR multiplier (k)", 0.5, 3.0, 1.5, step=0.1)
+# ---------- Sidebar: transparent, tunable thresholds + explanations ----------
+st.sidebar.header("Flag Thresholds")
+
+redund_sim = st.sidebar.slider(
+    "Redundant: title similarity (0–1)",
+    0.40, 0.95, 0.60, step=0.01,
+    help="Projects within the SAME area & year are marked redundant if their titles are ≥ this similarity. "
+         "Lower = more sensitive (more pairs flagged); higher = stricter."
+)
+
+ghost_hi_pct = st.sidebar.slider(
+    "Potential Ghost: 'high-amount' percentile",
+    50, 95, 75, step=1,
+    help="Defines what counts as a high-amount project based on this dataset’s distribution. "
+         "Used in ghost logic (e.g., very short completion for high-amount items)."
+)
+
+never_days = st.sidebar.number_input(
+    "Never-ending: minimum duration (days)",
+    min_value=365, max_value=1825, value=730, step=15,
+    help="Projects with duration ≥ this threshold are flagged as never-ending. "
+         "Duration is end − start; if no end, we use today − start."
+)
+
+cost_iqr_k = st.sidebar.slider(
+    "Costly: IQR multiplier (k)",
+    0.5, 3.0, 1.5, step=0.1,
+    help="Outlier threshold for ₱/km or ₱/sq-km using robust IQR. "
+         "Lower k = more sensitive (more outliers); higher k = stricter."
+)
 
 st.sidebar.header("Contractor Thresholds")
-contr_share = st.sidebar.slider("Concentration: max share in any area–year", 0.10, 0.90, 0.30, step=0.05)
-contr_repeat = st.sidebar.number_input("Repeated issues: min flagged projects", min_value=1, max_value=100, value=3, step=1)
-contr_cost_pctl = st.sidebar.slider("High mean unit cost: percentile", 60, 99, 90, step=1)
+contr_share = st.sidebar.slider(
+    "Concentration: max share in any area–year",
+    0.10, 0.90, 0.30, step=0.05,
+    help="A contractor is flagged for concentration if, in any area–year cluster, "
+         "their share of projects is ≥ this value."
+)
 
-# ---------- Compute flags & indicators ----------
+contr_repeat = st.sidebar.number_input(
+    "Repeated issues: minimum flagged projects",
+    min_value=1, max_value=100, value=3, step=1,
+    help="If a contractor has at least this many flagged projects "
+         "(ghost + never-ending + costly), they are flagged for repeated issues."
+)
+
+contr_cost_pctl = st.sidebar.slider(
+    "High mean unit cost: peer percentile",
+    60, 99, 90, step=1,
+    help="Contractor’s mean ₱/km (or ₱/sq-km) above this peer percentile is flagged. "
+         "Uses whichever unit metric has more complete data."
+)
+
+with st.sidebar.expander("ℹ️ About these thresholds"):
+    st.markdown("""
+- **Sensitivity vs specificity:** Lower thresholds flag **more** items (good for broad triage), higher thresholds flag **fewer** but stronger signals.  
+- **Dataset-relative:** Percentiles and IQR are computed **within your loaded file**, not a national baseline.  
+- **Transparency:** Thresholds are shown here so the public sees exactly how flags were derived.  
+- **Not findings:** Flags are **starting points** for document and site verification.
+""")
+
+# ---------- Cache heavy preprocessing (fast slider updates) ----------
+@st.cache_data(show_spinner=False)
+def _preprocess_once(df_input: pd.DataFrame):
+    """Heavy, file-dependent work. Recomputed only when the CSV content changes."""
+    return preprocess_projects(df_input)
+
+with st.spinner("Preparing data (one-time)…"):
+    prep = _preprocess_once(df)
+prepped_df, colmap = prep["prepped"], prep["colmap"]
+
+# ---------- Compute flags & indicators (fast) ----------
 with st.spinner("Computing screening indicators…"):
-    proj = compute_project_flags(
-        df,
+    proj = compute_project_flags_fast(
+        prepped_df,
+        colmap,
         redundant_similarity=redund_sim,
         ghost_high_amount_percentile=ghost_hi_pct,
         never_ending_days=never_days,
@@ -132,7 +192,7 @@ If the total crosses a threshold (e.g., **≥ 3**), it’s a **risk signal** for
 **c) Cost Outlier Rate**  
 The **fraction** of a contractor’s projects flagged as **cost outliers** (₱/km or ₱/sq-km) via **IQR**.  
 A consistently high rate suggests price reasonableness review (compare POW/estimates vs. outcomes).  
-*Legal anchor:* COA guidance on **IUEEU** expenditures (e.g., **COA Circular 2012-003**) and documentary sufficiency (**COA Circular 2023-004**).
+*Legal anchor:* COA guidance on **IUEEU** expenditures and documentary sufficiency.
         """)
 
         st.markdown("""
@@ -145,20 +205,20 @@ Those at or above a chosen percentile (e.g., **90th**) are flagged for **price r
     with st.expander(" How the numbers are computed"):
         st.markdown(f"""
 - **Concentration:** For each *area–year* cluster, contractor share = projects by contractor ÷ total projects.  
-  We flag if **max share** across any area–year ≥ the sidebar threshold (default **30%**).  
-- **Repeated Issues:** Sum of a contractor’s **ghost + never-ending + costly** flags; flagged if ≥ sidebar threshold (default **3**).  
+  We flag if **max share** across any area–year ≥ the sidebar threshold (default **{contr_share:.0%}**).  
+- **Repeated Issues:** Sum of a contractor’s **ghost + never-ending + costly** flags; flagged if ≥ sidebar threshold (default **{contr_repeat}**).  
 - **Cost Outlier Rate:** (# of **costly** projects) ÷ (total projects).  
-- **High Mean Unit Cost:** Choose the **denser** metric (₱/km if length data is more complete, else ₱/sq-km).  
-  Flag if the contractor’s mean ≥ sidebar percentile (default **90th**).  
-- **Robustness:** We rely on **median/IQR** to reduce distortion from extreme values; thresholds are **transparent & tunable** in the sidebar.
+- **High Mean Unit Cost:** We pick the **denser** metric (₱/km if length data is more complete, else ₱/sq-km).  
+  Flag if the contractor’s mean ≥ sidebar percentile (default **p{contr_cost_pctl}**).  
+- **Robustness:** We use **median/IQR** to limit distortion by extremes; thresholds are **transparent & tunable** on the left.
         """)
 
     with st.expander(" Due process & safeguards"):
         st.markdown("""
 - **Not a finding:** Indicators are **triage**. Any sanction requires **records review + site validation** and **due process**.  
 - **Context matters:** High concentration can occur where there are **few qualified bidders**; high costs may reflect **difficult sites**.  
-- **Documentation:** Verify **completion/acceptance**, inspection reports, **ORS/BURS**, and related documents per **COA 2023-004**.  
-- **Location naming:** For consistency, adopt **PSGC** for Region/Province/City/Barangay naming in future releases (improves grouping).
+- **Documentation:** Verify **completion/acceptance**, inspection reports, **ORS/BURS**, and related documents per COA guidance.  
+- **Data standards:** For consistency, adopt **PSGC** for Region/Province/City/Barangay naming in future releases (improves grouping).
         """)
 
     st.write("**Contractor Summary Table**")
@@ -180,11 +240,11 @@ with t3:
 with t4:
     st.subheader("Legal Basis ")
     st.markdown("""
-- **Procurement & Contract Implementation:** Updated IRR of **RA 9184** (19 Jul 2024) and **RA 12009 (New GPRA)** frame planning → bidding → **contract implementation** (inspection, completion, acceptance).
+- **Procurement & Contract Implementation:** Updated IRR of **RA 9184** and **RA 12009 (New GPRA)** frame planning → bidding → **contract implementation** (inspection, completion, acceptance).
 - **Audit Authority:** **PD 1445** (Government Auditing Code) mandates COA’s examination of records and post-audit/inspections.
 - **Documentation:** COA circulars and procurement audit guides emphasize **completion evidence**, inspection reports, and acceptance documents.
     """)
-    st.subheader("Data-Science Approach ")
+    st.subheader("Data-Science Approach")
     st.markdown(f"""
 - **Redundant:** Title similarity ≥ **{redund_sim:.2f}** within the same area & year.  
 - **Potential “Ghost”:** status/date logic; “high-amount” = top **{ghost_hi_pct}th** percentile of this dataset.  
