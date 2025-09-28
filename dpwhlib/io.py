@@ -1,4 +1,3 @@
-
 from pathlib import Path
 import io, csv
 import pandas as pd
@@ -15,16 +14,8 @@ def _sniff_sep(sample: str) -> str:
         return max(counts, key=counts.get) if any(counts.values()) else ","
 
 def read_base_csv_from_path(path: Path) -> pd.DataFrame:
-    """
-    Robust CSV loader:
-      • Tries multiple encodings
-      • Sniffs delimiter
-      • Skips bad lines
-      • Falls back to read_excel if CSV parse fails
-    """
     if not path.exists() or path.stat().st_size == 0:
         raise ValueError(f"{path} is missing or empty.")
-
     raw = path.read_bytes()
     head_bytes = raw[:32768]
     try:
