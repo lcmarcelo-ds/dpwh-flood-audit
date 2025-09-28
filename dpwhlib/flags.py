@@ -1,4 +1,4 @@
-# dpwhlib/flags.py
+
 import re
 import warnings
 import numpy as np
@@ -131,7 +131,7 @@ def _fast_redundant_flags(prepped: pd.DataFrame, title_col: str, similarity: flo
     if not title_col:
         return pd.Series(False, index=prepped.index)
 
-    thr = int(round(similarity * 100))  # rapidfuzz scale 0-100
+    thr = int(round(similarity * 100))  # 0–100 scale
     flags = np.zeros(len(prepped), dtype=bool)
 
     for (_, _), sub in prepped.groupby(["__AreaKey", "__Year"], dropna=False):
@@ -149,7 +149,7 @@ def _fast_redundant_flags(prepped: pd.DataFrame, title_col: str, similarity: flo
             flags[sub.index[list(hit_rows)]] = True
     return pd.Series(flags, index=prepped.index)
 
-# ----------------- stage 2: compute flags fast -----------------
+# ----------------- compute flags fast -----------------
 def compute_project_flags_fast(
     prepped: pd.DataFrame,
     colmap: dict,
@@ -235,10 +235,6 @@ def compute_project_flags(
     never_ending_days=730,
     cost_iqr_k=1.5
 ):
-    """
-    Backward-compat wrapper so existing imports keep working.
-    Internally runs the new two-stage pipeline.
-    """
     prep = preprocess_projects(df)
     return compute_project_flags_fast(
         prep["prepped"],
