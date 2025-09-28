@@ -4,9 +4,8 @@ import warnings
 import numpy as np
 import pandas as pd
 from rapidfuzz import process as rf_process, fuzz as rf_fuzz
-from .textutils import norm_text
 
-# ---------- helpers ----------
+# ----------------- helpers -----------------
 def _find_col(cols, patterns):
     for c in cols:
         if re.search(patterns, str(c), re.I):
@@ -29,16 +28,14 @@ def _safe_div(a, b):
     except Exception:
         return np.nan
 
-# ---------- stage 1: one-time preprocessing (cacheable) ----------
+def _norm_text(s: str) -> str:
+    s = "" if s is None else str(s).lower().strip()
+    s = re.sub(r"[^a-z0-9\s\-/,_()&.]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+# ----------------- stage 1: preprocess (cacheable) -----------------
 def preprocess_projects(df_raw: pd.DataFrame) -> dict:
-    """
-    Heavy work done once:
-      - detect columns
-      - parse dates quietly
-      - compute helper columns (__Year, __Amount, __AreaKey, __DurationDays, __LengthKm, __AreaSqKm, __CostPer*)
-      - normalized strings for fast matching (__TitleNorm, __ContractorNorm)
-    Returns dict with 'prepped' (DataFrame) and 'colmap' (detected columns).
-    """
     df = df_raw.copy()
     cols = list(df.columns)
 
@@ -57,7 +54,6 @@ def preprocess_projects(df_raw: pd.DataFrame) -> dict:
     len_cols = _find_cols_any(cols, r"(length|linear|km|meters|m\.)")
     area_cols = _find_cols_any(cols, r"(area|sqkm|sqm|hect|ha)")
 
-    # Quiet mixed-date warnings and coerce invalids to NaT
     if start_col:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -67,7 +63,6 @@ def preprocess_projects(df_raw: pd.DataFrame) -> dict:
             warnings.simplefilter("ignore")
             df[end_col] = pd.to_datetime(df[end_col], errors="coerce", format="mixed")
 
-    # Year
     if year_col:
         df["__Year"] = df[year_col].apply(_extract_year).astype("Int64")
     else:
@@ -76,21 +71,18 @@ def preprocess_projects(df_raw: pd.DataFrame) -> dict:
         if use:
             df["__Year"] = df[use].apply(lambda r: r.dropna().iloc[0].year if r.dropna().shape[0]>0 else np.nan, axis=1).astype("Int64")
 
-    # Amount
-    if amount_col:
-        df["__Amount"] = pd.to_numeric(df[amount_col].astype(str).str.replace(",","", regex=False), errors="coerce")
-    else:
-        df["__Amount"] = np.nan
+    df["__Amount"] = (
+        pd.to_numeric(df[amount_col].astype(str).str.replace(",","", regex=False), errors="coerce")
+        if amount_col else np.nan
+    )
 
-    # Area key
     loc_cols = [c for c in [region_col, province_col, city_col, barangay_col] if c]
     if loc_cols:
-        df["__AreaKey"] = df[loc_cols].astype(str).agg(", ".join, axis=1).map(norm_text)
+        df["__AreaKey"] = df[loc_cols].astype(str).agg(", ".join, axis=1).map(_norm_text)
     else:
         loc_guess = _find_col(cols, r"(location|site|river|barangay|place)")
-        df["__AreaKey"] = df[loc_guess].astype(str).map(norm_text) if loc_guess else ""
+        df["__AreaKey"] = df[loc_guess].astype(str).map(_norm_text) if loc_guess else ""
 
-    # Duration
     if start_col and end_col:
         df["__DurationDays"] = (df[end_col] - df[start_col]).dt.days
     elif start_col:
@@ -98,11 +90,9 @@ def preprocess_projects(df_raw: pd.DataFrame) -> dict:
     else:
         df["__DurationDays"] = np.nan
 
-    # Norm strings
-    df["__TitleNorm"] = df[title_col].astype(str).map(norm_text) if title_col else ""
-    df["__ContractorNorm"] = df[contractor_col].astype(str).map(norm_text) if contractor_col else ""
+    df["__TitleNorm"] = df[title_col].astype(str).map(_norm_text) if title_col else ""
+    df["__ContractorNorm"] = df[contractor_col].astype(str).map(_norm_text) if contractor_col else ""
 
-    # Unit conversions
     length_col = len_cols[0] if len_cols else None
     area_col   = area_cols[0] if area_cols else None
 
@@ -136,45 +126,30 @@ def preprocess_projects(df_raw: pd.DataFrame) -> dict:
     }
     return {"prepped": df, "colmap": colmap}
 
-# ---------- stage 2: fast flags from prepped df ----------
+# ----------------- fast redundant flags -----------------
 def _fast_redundant_flags(prepped: pd.DataFrame, title_col: str, similarity: float) -> pd.Series:
-    """
-    Mark projects as redundant if there exists another in the same (AreaKey, Year)
-    with token_set_ratio >= similarity threshold.
-    Uses rapidfuzz.cdist (C-optimized) per block.
-    """
     if not title_col:
         return pd.Series(False, index=prepped.index)
 
-    thr = int(round(similarity * 100))  # rapidfuzz returns 0-100
+    thr = int(round(similarity * 100))  # rapidfuzz scale 0-100
     flags = np.zeros(len(prepped), dtype=bool)
 
-    # Work in blocks to avoid O(n^2) across whole dataset
     for (_, _), sub in prepped.groupby(["__AreaKey", "__Year"], dropna=False):
         if len(sub) < 2:
             continue
         titles = sub[title_col].astype(str).tolist()
-        # Compute pairwise token_set_ratio (fast C) with a cutoff
-        mat = rf_process.cdist(
-            titles, titles,
-            scorer=rf_fuzz.token_set_ratio,
-            score_cutoff=thr
-        )
-        # mat is dense; mark i if any j != i has score >= thr
-        # We'll look only at upper triangle to avoid diagonal/self
+        mat = rf_process.cdist(titles, titles, scorer=rf_fuzz.token_set_ratio, score_cutoff=thr)
         n = len(titles)
         hit_rows = set()
         for i in range(n):
-            # Check any j where mat[i,j] >= thr and j!=i
-            # Avoid scanning all cells: slice & mask
             row = mat[i]
-            # rapidfuzz returns numpy array, diagonal equals 100, so we need > thr or >= thr with j!=i
             if (row[:i] >= thr).any() or (row[i+1:] >= thr).any():
                 hit_rows.add(i)
         if hit_rows:
             flags[sub.index[list(hit_rows)]] = True
     return pd.Series(flags, index=prepped.index)
 
+# ----------------- stage 2: compute flags fast -----------------
 def compute_project_flags_fast(
     prepped: pd.DataFrame,
     colmap: dict,
@@ -190,32 +165,19 @@ def compute_project_flags_fast(
     start_col   = colmap.get("start")
     end_col     = colmap.get("end")
 
-    # Redundant (fast)
     df["FLAG_RedundantSameAreaYear"] = _fast_redundant_flags(df, title_col, redundant_similarity)
 
-    # Potential Ghost
     amt_hi = np.nanpercentile(df["__Amount"].dropna(), ghost_high_amount_percentile) if df["__Amount"].notna().any() else np.nan
     status_vals = df[status_col].astype(str).str.lower().str.strip() if status_col else pd.Series("", index=df.index)
     completeish = status_vals.str.contains("complete") | status_vals.str.contains(r"\b100\b")
     no_end = df[end_col].isna() if end_col else pd.Series(True, index=df.index)
-    very_short = (
-        (df[end_col] - df[start_col]).dt.days < 7
-        if start_col and end_col else pd.Series(False, index=df.index)
-    )
+    very_short = ((df[end_col] - df[start_col]).dt.days < 7) if start_col and end_col else pd.Series(False, index=df.index)
     high_amt = (df["__Amount"] >= amt_hi) if np.isfinite(amt_hi) else pd.Series(False, index=df.index)
-    long_open = (
-        (pd.Timestamp.now() - df[start_col]).dt.days > 730
-        if start_col else pd.Series(False, index=df.index)
-    )
+    long_open = ((pd.Timestamp.now() - df[start_col]).dt.days > 730) if start_col else pd.Series(False, index=df.index)
     no_dates = (df[start_col].isna() if start_col else True) & (df[end_col].isna() if end_col else True)
-    ghost_flag = (
-        (completeish & no_end) |
-        (completeish & very_short & high_amt) |
-        (long_open & no_end) |
-        (no_dates & high_amt)
-    )
+
+    ghost_flag = (completeish & no_end) | (completeish & very_short & high_amt) | (long_open & no_end) | (no_dates & high_amt)
     reasons = []
-    # Reasons are lightweight to compute; keep clarity
     reasons.append(np.where(completeish & no_end, "Completed status but no completion date", ""))
     reasons.append(np.where(completeish & very_short & high_amt, "Very short completion for high-amount project", ""))
     reasons.append(np.where(long_open & no_end, ">2 years elapsed without completion", ""))
@@ -225,19 +187,15 @@ def compute_project_flags_fast(
     df["FLAG_PotentialGhost"] = ghost_flag.fillna(False)
     df["Reason_PotentialGhost"] = reason_col
 
-    # Never-ending
     dur_ok = df["__DurationDays"].fillna(-1)
     df["FLAG_NeverEnding"] = dur_ok.ge(never_ending_days)
 
-    # Costly (IQR)
     def iqr_bounds(s: pd.Series, k=1.5):
         s2 = s.astype(float).replace([np.inf, -np.inf], np.nan).dropna()
-        if s2.empty:
-            return np.nan, np.nan
+        if s2.empty: return np.nan, np.nan
         q1, q3 = s2.quantile(0.25), s2.quantile(0.75)
         iqr = q3 - q1
         if iqr <= 0:
-            # fallback to std if needed
             std = s2.std()
             iqr = std if std > 0 else 1.0
         return (q1 - k*iqr, q3 + k*iqr)
@@ -249,9 +207,8 @@ def compute_project_flags_fast(
     df["CostMetricUsed"] = metric_name
     df["CostOutlierLow"], df["CostOutlierHigh"] = low_t, high_t
 
-    # Outputs
     flag_cols = ["FLAG_RedundantSameAreaYear","FLAG_PotentialGhost","FLAG_NeverEnding","FLAG_Costly"]
-    out = {
+    return {
         "annotated_full": df.copy(),
         "redundant": df[df["FLAG_RedundantSameAreaYear"]].copy(),
         "ghost": df[df["FLAG_PotentialGhost"]].copy(),
@@ -269,9 +226,8 @@ def compute_project_flags_fast(
             ]
         })
     }
-    return out
 
-# --- Backward-compat shim: keep old API name working ---
+# ----------------- legacy name (compat shim) -----------------
 def compute_project_flags(
     df,
     redundant_similarity=0.60,
@@ -280,8 +236,8 @@ def compute_project_flags(
     cost_iqr_k=1.5
 ):
     """
-    Legacy wrapper for backward compatibility.
-    Runs the new two-stage pipeline under the hood.
+    Backward-compat wrapper so existing imports keep working.
+    Internally runs the new two-stage pipeline.
     """
     prep = preprocess_projects(df)
     return compute_project_flags_fast(
