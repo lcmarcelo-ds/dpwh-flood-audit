@@ -1,3 +1,4 @@
+
 from pathlib import Path
 import textwrap
 import pandas as pd
@@ -12,6 +13,10 @@ st.set_page_config(page_title="DPWH Flood-Control Audit ", layout="wide")
 # ---------- Data path (bundled; no uploads) ----------
 DATA_DIR = Path(__file__).parent / "data"
 BASE_CSV = DATA_DIR / "Flood_Control_Data.csv"
+
+st.title("DPWH Flood-Control Audit")
+st.caption("Rules-based screening using the Flood Control Data ; includes contractor indicators.")
+st.caption(f"flags.py version: {__FLAGSLIB_VERSION__}")
 
 with st.expander("How to read this dashboard"):
     st.markdown("""
@@ -87,18 +92,6 @@ st.sidebar.header("Geographic grouping")
 geo_cell_km = st.sidebar.slider(
     "Geo area cell (km)", 1, 50, 5, step=1,
     help="Projects within the same lat/lon grid cell are considered the same area (used for Redundant & Never-ending rules). Smaller cell = more precise."
-)
-
-
-
-st.sidebar.header("Extra rules")
-use_target_overrun = st.sidebar.checkbox(
-    "Use target-completion overrun rule", value=True,
-    help="If target completion exists, project not completed, and target+grace has passed → flag as potential ghost."
-)
-grace_days = st.sidebar.number_input(
-    "Grace days for target overrun", min_value=0, max_value=365, value=60, step=5,
-    help="Additional grace period after target completion before overrun is flagged."
 )
 
 
@@ -207,7 +200,7 @@ with t3:
         st.download_button(f"Download {label}", data=save_csv_bytes(dfv), file_name=label, mime="text/csv")
 
 with t4:
-    st.subheader("Legal • Data-Science • Policy (Philippines)")
+    st.subheader("Legal • Data-Science • Policy ")
     st.markdown("""
 ### Legal anchors (plain language, with links)
 - **RA 9184 – Government Procurement Reform Act** and its **2016 Revised IRR** (as updated).  
