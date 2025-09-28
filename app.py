@@ -106,13 +106,62 @@ with t1:
 
 with t2:
     st.subheader("Contractor Indicators")
+
     st.markdown("""
-**Computed from project flags (data-only):**
-- **Concentration**: contractor’s max share within any *area–year* cluster.  
-- **Repeated Issues**: total of ghost/never-ending/costly flags across the contractor’s projects ≥ threshold.  
-- **Cost Outlier Rate**: fraction of projects flagged as costly outliers.  
-- **High Mean Unit Cost**: contractor’s mean ₱/km (or ₱/sq-km) ≥ chosen percentile vs. peers.
+These are **screening indicators** to prioritize review. They do **not** prove wrongdoing. 
+Use them to queue **document checks** (POW, plans/estimates, inspection, completion/acceptance) 
+and **site verification** before any conclusion.
     """)
+
+    with st.expander("🔎 What the indicators mean"):
+        st.markdown("""
+**a) Concentration (Share within an area–year)**  
+We compute, for each contractor, their **share of all projects** within the same area (Region/Province/City) and **year**.  
+A **high share** (e.g., ≥ 30%) may **signal reduced competition** and merits checking bid histories (e.g., single-bidder cases).  
+*Legal anchor:* Procurement must be **competitive and transparent** under **RA 9184 IRR** and **RA 12009 IRR** (contract implementation covered).  
+        """)
+
+        st.markdown("""
+**b) Repeated Issues (sum of flagged projects)**  
+For each contractor, we count how many of their projects were flagged as **Potential Ghost**, **Never-ending**, or **Costly**.  
+If the total crosses a threshold (e.g., **≥ 3**), it’s a **risk signal** for performance review and closer audit scrutiny.  
+*Legal anchor:* **PD 1445** (COA’s audit mandate) and **RA 9184** allow remedies (e.g., sanctions/blacklisting) **after due process** when warranted.
+        """)
+
+        st.markdown("""
+**c) Cost Outlier Rate**  
+The **fraction** of a contractor’s projects flagged as **cost outliers** (₱/km or ₱/sq-km) via **IQR**.  
+A consistently high rate suggests price reasonableness review (compare POW/estimates vs. outcomes).  
+*Legal anchor:* COA guidance on **IUEEU** expenditures (e.g., **COA Circular 2012-003**) and documentary sufficiency (**COA Circular 2023-004**).
+        """)
+
+        st.markdown("""
+**d) High Mean Unit Cost (peer comparison)**  
+We compare each contractor’s **average** ₱/km (or ₱/sq-km) with peers.  
+Those at or above a chosen percentile (e.g., **90th**) are flagged for **price reasonableness** review and context checks (terrain, scope).  
+*Legal anchor:* **Value for Money** principle in procurement (RA 9184/RA 12009 and their IRR).
+        """)
+
+    with st.expander(" How the numbers are computed"):
+        st.markdown(f"""
+- **Concentration:** For each *area–year* cluster, contractor share = projects by contractor ÷ total projects.  
+  We flag if **max share** across any area–year ≥ the sidebar threshold (default **30%**).  
+- **Repeated Issues:** Sum of a contractor’s **ghost + never-ending + costly** flags; flagged if ≥ sidebar threshold (default **3**).  
+- **Cost Outlier Rate:** (# of **costly** projects) ÷ (total projects).  
+- **High Mean Unit Cost:** Choose the **denser** metric (₱/km if length data is more complete, else ₱/sq-km).  
+  Flag if the contractor’s mean ≥ sidebar percentile (default **90th**).  
+- **Robustness:** We rely on **median/IQR** to reduce distortion from extreme values; thresholds are **transparent & tunable** in the sidebar.
+        """)
+
+    with st.expander(" Due process & safeguards"):
+        st.markdown("""
+- **Not a finding:** Indicators are **triage**. Any sanction requires **records review + site validation** and **due process**.  
+- **Context matters:** High concentration can occur where there are **few qualified bidders**; high costs may reflect **difficult sites**.  
+- **Documentation:** Verify **completion/acceptance**, inspection reports, **ORS/BURS**, and related documents per **COA 2023-004**.  
+- **Location naming:** For consistency, adopt **PSGC** for Region/Province/City/Barangay naming in future releases (improves grouping).
+        """)
+
+    st.write("**Contractor Summary Table**")
     st.dataframe(contr["contractor_table"].head(100), use_container_width=True)
 
 with t3:
@@ -129,13 +178,13 @@ with t3:
         st.download_button(f"Download {label}", data=save_csv_bytes(dfv), file_name=label, mime="text/csv")
 
 with t4:
-    st.subheader("Legal Basis (Philippines)")
+    st.subheader("Legal Basis ")
     st.markdown("""
 - **Procurement & Contract Implementation:** Updated IRR of **RA 9184** (19 Jul 2024) and **RA 12009 (New GPRA)** frame planning → bidding → **contract implementation** (inspection, completion, acceptance).
 - **Audit Authority:** **PD 1445** (Government Auditing Code) mandates COA’s examination of records and post-audit/inspections.
 - **Documentation:** COA circulars and procurement audit guides emphasize **completion evidence**, inspection reports, and acceptance documents.
     """)
-    st.subheader("Data-Science Basis")
+    st.subheader("Data-Science Approach ")
     st.markdown(f"""
 - **Redundant:** Title similarity ≥ **{redund_sim:.2f}** within the same area & year.  
 - **Potential “Ghost”:** status/date logic; “high-amount” = top **{ghost_hi_pct}th** percentile of this dataset.  
