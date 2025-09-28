@@ -1,4 +1,4 @@
-
+# app.py
 from pathlib import Path
 import textwrap
 import pandas as pd
@@ -8,15 +8,14 @@ from dpwhlib.io import read_base_csv_from_path, save_csv_bytes
 from dpwhlib.flags import preprocess_projects, compute_project_flags_fast, __FLAGSLIB_VERSION__
 from dpwhlib.contractor import compute_contractor_indicators
 
-st.set_page_config(page_title="DPWH Flood-Control Audit ", layout="wide")
+st.set_page_config(page_title="DPWH Flood-Control Screening (Projects + Contractors)", layout="wide")
 
 # ---------- Data path (bundled; no uploads) ----------
 DATA_DIR = Path(__file__).parent / "data"
 BASE_CSV = DATA_DIR / "Flood_Control_Data.csv"
 
 st.title("DPWH Flood-Control Audit")
-st.caption("Rules-based screening using the Flood Control Data ; includes contractor indicators.")
-st.caption(f"flags.py version: {__FLAGSLIB_VERSION__}")
+st.caption("Rules-based screening using the DWPH and Sumbongpangulo flood control dataset; includes contractor indicators.")
 
 with st.expander("How to read this dashboard"):
     st.markdown("""
@@ -94,6 +93,58 @@ geo_cell_km = st.sidebar.slider(
     help="Projects within the same lat/lon grid cell are considered the same area (used for Redundant & Never-ending rules). Smaller cell = more precise."
 )
 
+# ---------- Sidebar: column overrides & extra rules ----------
+st.sidebar.header("Columns (optional overrides)")
+cols = list(df.columns)
+def _sel(label): return st.sidebar.selectbox(label, ["(auto)"] + cols, index=0)
+
+title_col_sel = _sel("Project title")
+amount_col_sel = _sel("Amount / Contract cost")
+status_col_sel = _sel("Status or % complete")
+start_col_sel  = _sel("Start / NTP date")
+end_col_sel    = _sel("Completion date (actual)")
+target_col_sel = _sel("Target completion date")
+year_col_sel   = _sel("Year")
+region_col_sel = _sel("Region")
+prov_col_sel   = _sel("Province")
+city_col_sel   = _sel("City/Municipality")
+brgy_col_sel   = _sel("Barangay")
+contractor_col_sel = _sel("Contractor/Supplier")
+length_col_sel = _sel("Length (m/km)")
+area_col_sel   = _sel("Area (sqm/hectares)")
+lat_col_sel    = _sel("Latitude")
+lon_col_sel    = _sel("Longitude")
+
+st.sidebar.header("Extra rules")
+use_target_overrun = st.sidebar.checkbox(
+    "Use target-completion overrun rule", value=True,
+    help="If target completion exists, project not completed, and target+grace has passed → flag as potential ghost."
+)
+grace_days = st.sidebar.number_input(
+    "Grace days for target overrun", min_value=0, max_value=365, value=60, step=5,
+    help="Additional grace period after target completion before overrun is flagged."
+)
+
+col_overrides = {
+    k: (None if v == "(auto)" else v) for k, v in dict(
+        title=title_col_sel,
+        amount=amount_col_sel,
+        status=status_col_sel,
+        start=start_col_sel,
+        end=end_col_sel,
+        target=target_col_sel,
+        year=year_col_sel,
+        region=region_col_sel,
+        province=prov_col_sel,
+        city=city_col_sel,
+        barangay=brgy_col_sel,
+        contractor=contractor_col_sel,
+        length=length_col_sel,
+        area=area_col_sel,
+        lat=lat_col_sel,
+        lon=lon_col_sel,
+    ).items()
+}
 
 with st.sidebar.expander(" How these thresholds work"):
     st.markdown(f"""
