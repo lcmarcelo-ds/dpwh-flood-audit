@@ -1,4 +1,4 @@
-# app.py
+
 from pathlib import Path
 import textwrap
 import pandas as pd
@@ -24,6 +24,8 @@ with st.expander("How to read this dashboard"):
 **What it shows:** Project-level flags (redundant, ghost, never-ending, costly) **and** contractor indicators (concentration, repeated issues, outlier rates).  
 **Not legal findings:** Always verify with records and site inspection before conclusions.
 """)
+
+
 
 # ---------- Robust load guard ----------
 if not BASE_CSV.exists():
@@ -55,7 +57,7 @@ ghost_hi_pct = st.sidebar.slider(
 )
 never_days = st.sidebar.number_input(
     "Never-ending: minimum duration (days)", min_value=365, max_value=1825, value=730, step=15,
-    help="Projects with duration ≥ this are flagged. If no end date, uses today − start."
+    help="Projects with duration ≥ this are flagged. If no end date, a stricter prolonged-open rule is used."
 )
 cost_iqr_k = st.sidebar.slider(
     "Costly: IQR multiplier (k)", 0.5, 3.0, 1.5, step=0.1,
@@ -74,6 +76,13 @@ contr_repeat = st.sidebar.number_input(
 contr_cost_pctl = st.sidebar.slider(
     "High mean unit cost: peer percentile", 60, 99, 90, step=1,
     help="Flag if contractor mean ₱/km (or ₱/sq-km) ≥ this percentile vs. peers."
+)
+
+# ---------- Sidebar: geographic grouping ----------
+st.sidebar.header("Geographic grouping")
+geo_cell_km = st.sidebar.slider(
+    "Geo area cell (km)", 1, 50, 5, step=1,
+    help="Projects within the same lat/lon grid cell are considered the same area (used for Redundant & Never-ending rules)."
 )
 
 # ---------- Sidebar: column overrides & extra rules ----------
@@ -95,6 +104,8 @@ brgy_col_sel   = _sel("Barangay")
 contractor_col_sel = _sel("Contractor/Supplier")
 length_col_sel = _sel("Length (m/km)")
 area_col_sel   = _sel("Area (sqm/hectares)")
+lat_col_sel    = _sel("Latitude")
+lon_col_sel    = _sel("Longitude")
 
 st.sidebar.header("Extra rules")
 use_target_overrun = st.sidebar.checkbox(
@@ -121,7 +132,9 @@ col_overrides = {
         barangay=brgy_col_sel,
         contractor=contractor_col_sel,
         length=length_col_sel,
-        area=area_col_sel
+        area=area_col_sel,
+        lat=lat_col_sel,
+        lon=lon_col_sel,
     ).items()
 }
 
@@ -135,11 +148,11 @@ with st.sidebar.expander(" About these thresholds"):
 
 # ---------- Cache heavy preprocessing ----------
 @st.cache_data(show_spinner=False)
-def _preprocess_once(df_input: pd.DataFrame, overrides: dict):
-    return preprocess_projects(df_input, overrides=overrides)
+def _preprocess_once(df_input: pd.DataFrame, overrides: dict, geo_cell_km: float):
+    return preprocess_projects(df_input, overrides=overrides, geo_cell_km=geo_cell_km)
 
 with st.spinner("Preparing data (one-time)…"):
-    prep = _preprocess_once(df, col_overrides)
+    prep = _preprocess_once(df, col_overrides, geo_cell_km)
 prepped_df, colmap = prep["prepped"], prep["colmap"]
 
 # Show a tiny detection report
@@ -185,21 +198,21 @@ t1, t2, t3, t4 = st.tabs([
 
 with t1:
     st.subheader("Project Flags")
-    # show reasons/labels to make review faster
     cols_to_show = [
         colmap.get("title") or "Title",
-        "FLAG_RedundantSameAreaYear","RedundantGroupID","Reason_Redundant",
+        "FLAG_RedundantSameAreaYear","RedundantGroupID","Reason_Redundant","RedundantPeers",
         "FLAG_PotentialGhost","Reason_PotentialGhost",
         "FLAG_NeverEnding","Reason_NeverEnding",
         "FLAG_Costly","Reason_Costly",
-        "CostRate","CostRateUnit","CostRatePercentile"
+        "CostRate","CostRateUnit","CostRatePercentile",
+        "__AreaKey","__AreaKeySource"
     ]
     for key, label in [
         ("all_flagged", "All flagged projects"),
         ("redundant", "Redundant (same area + same year + similar titles)"),
         ("ghost", "Potential ghost (status/date inconsistencies & target overrun)"),
         ("neverending", "Never-ending (long duration or recurring titles)"),
-        ("costly", "Costly (₱/km or ₱/sq-km outliers)")
+        ("costly", "Costly (₱/km or ₱/sq-km outliers; falls back to Amount if no units)"),
     ]:
         dfv = proj.get(key, pd.DataFrame())
         st.caption(f"{label} — {len(dfv):,} rows")
@@ -213,13 +226,6 @@ These are **screening indicators** to prioritize review. They do **not** prove w
 Use them to queue **document checks** (POW, plans/estimates, inspection, completion/acceptance) 
 and **site verification** before any conclusion.
     """)
-    with st.expander("🔎 What the indicators mean"):
-        st.markdown("""
-**a) Concentration (Share within an area–year)** → competition risk screen.  
-**b) Repeated Issues** → count of ghost/never-ending/costly flags per contractor.  
-**c) Cost Outlier Rate** → fraction of contractor projects flagged as costly.  
-**d) High Mean Unit Cost** → contractor’s mean ₱/km or ₱/sq-km ≥ chosen peer percentile.
-        """)
     st.write("**Contractor Summary Table**")
     st.dataframe(contr["contractor_table"].head(150), use_container_width=True)
 
@@ -237,7 +243,7 @@ with t3:
         st.download_button(f"Download {label}", data=save_csv_bytes(dfv), file_name=label, mime="text/csv")
 
 with t4:
-    st.subheader("Legal • Data-Science • Policy ")
+    st.subheader("Legal • Data-Science • Policy (Philippines)")
     st.markdown("""
 - **Procurement & Contract Implementation:** Updated IRR of **RA 9184** and **RA 12009 (New GPRA)** cover planning → bidding → **contract implementation** (inspection, completion, acceptance).
 - **Audit Authority:** **PD 1445** mandates **COA** examination of records and post-audit/inspections.
@@ -245,8 +251,8 @@ with t4:
     """)
     st.markdown(f"""
 **Data-Science Basis**  
-- **Redundant:** Same area & year; similarity ≥ **{redund_sim:.2f}** and ≥2 uncommon tokens in common.  
+- **Redundant:** Same area & year (now by geo grid if lat/lon present); similarity ≥ **{redund_sim:.2f}** and ≥2 uncommon tokens in common.  
 - **Potential “Ghost”:** status/date logic; “high-amount” = top **{ghost_hi_pct}th** percentile; optional **target overrun** with {grace_days}-day grace.  
-- **Never-ending:** duration ≥ **{never_days}** days or recurring similar titles across ≥ 3 years in the same area.  
-- **Costly:** **IQR** outliers on ₱/km or ₱/sq-km (k = **{cost_iqr_k}**), with explicit **CostRate** and unit.
+- **Never-ending:** duration ≥ **{never_days}** days with end date, or recurring similar titles across ≥ 3 years in the same area; prolonged-open needs stricter limits.  
+- **Costly:** **IQR** outliers on ₱/km or ₱/sq-km (k = **{cost_iqr_k}**), with explicit **CostRate** and unit; falls back to IQR on **Amount** if units missing.
     """)
