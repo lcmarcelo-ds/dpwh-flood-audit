@@ -89,27 +89,7 @@ geo_cell_km = st.sidebar.slider(
     help="Projects within the same lat/lon grid cell are considered the same area (used for Redundant & Never-ending rules). Smaller cell = more precise."
 )
 
-# ---------- Sidebar: column overrides & extra rules ----------
-st.sidebar.header("Columns (optional overrides)")
-cols = list(df.columns)
-def _sel(label): return st.sidebar.selectbox(label, ["(auto)"] + cols, index=0)
 
-title_col_sel = _sel("Project title")
-amount_col_sel = _sel("Amount / Contract cost")
-status_col_sel = _sel("Status or % complete")
-start_col_sel  = _sel("Start / NTP date")
-end_col_sel    = _sel("Completion date (actual)")
-target_col_sel = _sel("Target completion date")
-year_col_sel   = _sel("Year")
-region_col_sel = _sel("Region")
-prov_col_sel   = _sel("Province")
-city_col_sel   = _sel("City/Municipality")
-brgy_col_sel   = _sel("Barangay")
-contractor_col_sel = _sel("Contractor/Supplier")
-length_col_sel = _sel("Length (m/km)")
-area_col_sel   = _sel("Area (sqm/hectares)")
-lat_col_sel    = _sel("Latitude")
-lon_col_sel    = _sel("Longitude")
 
 st.sidebar.header("Extra rules")
 use_target_overrun = st.sidebar.checkbox(
