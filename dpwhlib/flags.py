@@ -1,9 +1,12 @@
+# dpwhlib/flags.py
 import re
 import warnings
 import numpy as np
 import pandas as pd
-from .textutils import norm_text, seq_ratio
+from rapidfuzz import process as rf_process, fuzz as rf_fuzz
+from .textutils import norm_text
 
+# ---------- helpers ----------
 def _find_col(cols, patterns):
     for c in cols:
         if re.search(patterns, str(c), re.I):
@@ -26,14 +29,17 @@ def _safe_div(a, b):
     except Exception:
         return np.nan
 
-def compute_project_flags(
-    df: pd.DataFrame,
-    redundant_similarity=0.60,
-    ghost_high_amount_percentile=75,
-    never_ending_days=730,
-    cost_iqr_k=1.5
-) -> dict:
-    out = {}
+# ---------- stage 1: one-time preprocessing (cacheable) ----------
+def preprocess_projects(df_raw: pd.DataFrame) -> dict:
+    """
+    Heavy work done once:
+      - detect columns
+      - parse dates quietly
+      - compute helper columns (__Year, __Amount, __AreaKey, __DurationDays, __LengthKm, __AreaSqKm, __CostPer*)
+      - normalized strings for fast matching (__TitleNorm, __ContractorNorm)
+    Returns dict with 'prepped' (DataFrame) and 'colmap' (detected columns).
+    """
+    df = df_raw.copy()
     cols = list(df.columns)
 
     title_col  = _find_col(cols, r"(project|title|scope|description|name)")
@@ -51,8 +57,6 @@ def compute_project_flags(
     len_cols = _find_cols_any(cols, r"(length|linear|km|meters|m\.)")
     area_cols = _find_cols_any(cols, r"(area|sqkm|sqm|hect|ha)")
 
-    df = df.copy()
-
     # Quiet mixed-date warnings and coerce invalids to NaT
     if start_col:
         with warnings.catch_warnings():
@@ -63,18 +67,22 @@ def compute_project_flags(
             warnings.simplefilter("ignore")
             df[end_col] = pd.to_datetime(df[end_col], errors="coerce", format="mixed")
 
-    # Helper cols
-    df["__Year"] = df[year_col].apply(_extract_year).astype("Int64") if year_col else pd.Series(pd.NA, index=df.index, dtype="Int64")
-    if df["__Year"].isna().all():
+    # Year
+    if year_col:
+        df["__Year"] = df[year_col].apply(_extract_year).astype("Int64")
+    else:
+        df["__Year"] = pd.Series(pd.NA, index=df.index, dtype="Int64")
         use = [c for c in [start_col, end_col] if c]
         if use:
             df["__Year"] = df[use].apply(lambda r: r.dropna().iloc[0].year if r.dropna().shape[0]>0 else np.nan, axis=1).astype("Int64")
 
-    df["__Amount"] = (
-        pd.to_numeric(df[amount_col].astype(str).str.replace(",","", regex=False), errors="coerce")
-        if amount_col else np.nan
-    )
+    # Amount
+    if amount_col:
+        df["__Amount"] = pd.to_numeric(df[amount_col].astype(str).str.replace(",","", regex=False), errors="coerce")
+    else:
+        df["__Amount"] = np.nan
 
+    # Area key
     loc_cols = [c for c in [region_col, province_col, city_col, barangay_col] if c]
     if loc_cols:
         df["__AreaKey"] = df[loc_cols].astype(str).agg(", ".join, axis=1).map(norm_text)
@@ -82,6 +90,7 @@ def compute_project_flags(
         loc_guess = _find_col(cols, r"(location|site|river|barangay|place)")
         df["__AreaKey"] = df[loc_guess].astype(str).map(norm_text) if loc_guess else ""
 
+    # Duration
     if start_col and end_col:
         df["__DurationDays"] = (df[end_col] - df[start_col]).dt.days
     elif start_col:
@@ -89,6 +98,7 @@ def compute_project_flags(
     else:
         df["__DurationDays"] = np.nan
 
+    # Norm strings
     df["__TitleNorm"] = df[title_col].astype(str).map(norm_text) if title_col else ""
     df["__ContractorNorm"] = df[contractor_col].astype(str).map(norm_text) if contractor_col else ""
 
@@ -118,88 +128,145 @@ def compute_project_flags(
     df["__CostPerKm"]   = df.apply(lambda r: _safe_div(r["__Amount"], r["__LengthKm"]) if pd.notna(r["__LengthKm"]) else np.nan, axis=1)
     df["__CostPerSqKm"] = df.apply(lambda r: _safe_div(r["__Amount"], r["__AreaSqKm"]) if pd.notna(r["__AreaSqKm"]) else np.nan, axis=1)
 
-    # Redundant
-    redundant_idx = set()
-    if title_col:
-        for (_, _), sub in df.groupby(["__AreaKey", "__Year"], dropna=False):
-            if len(sub) < 2: continue
-            titles = sub[title_col].astype(str).tolist()
-            idxs = sub.index.tolist()
-            for i in range(len(titles)):
-                for j in range(i+1, len(titles)):
-                    if seq_ratio(titles[i], titles[j]) >= redundant_similarity:
-                        redundant_idx.add(idxs[i]); redundant_idx.add(idxs[j])
-    df["FLAG_RedundantSameAreaYear"] = df.index.isin(redundant_idx)
+    colmap = {
+        "title": title_col, "amount": amount_col, "status": status_col,
+        "start": start_col, "end": end_col, "year": year_col,
+        "region": region_col, "province": province_col, "city": city_col, "barangay": barangay_col,
+        "contractor": contractor_col, "length": length_col, "area": area_col
+    }
+    return {"prepped": df, "colmap": colmap}
+
+# ---------- stage 2: fast flags from prepped df ----------
+def _fast_redundant_flags(prepped: pd.DataFrame, title_col: str, similarity: float) -> pd.Series:
+    """
+    Mark projects as redundant if there exists another in the same (AreaKey, Year)
+    with token_set_ratio >= similarity threshold.
+    Uses rapidfuzz.cdist (C-optimized) per block.
+    """
+    if not title_col:
+        return pd.Series(False, index=prepped.index)
+
+    thr = int(round(similarity * 100))  # rapidfuzz returns 0-100
+    flags = np.zeros(len(prepped), dtype=bool)
+
+    # Work in blocks to avoid O(n^2) across whole dataset
+    for (_, _), sub in prepped.groupby(["__AreaKey", "__Year"], dropna=False):
+        if len(sub) < 2:
+            continue
+        titles = sub[title_col].astype(str).tolist()
+        # Compute pairwise token_set_ratio (fast C) with a cutoff
+        mat = rf_process.cdist(
+            titles, titles,
+            scorer=rf_fuzz.token_set_ratio,
+            score_cutoff=thr
+        )
+        # mat is dense; mark i if any j != i has score >= thr
+        # We'll look only at upper triangle to avoid diagonal/self
+        n = len(titles)
+        hit_rows = set()
+        for i in range(n):
+            # Check any j where mat[i,j] >= thr and j!=i
+            # Avoid scanning all cells: slice & mask
+            row = mat[i]
+            # rapidfuzz returns numpy array, diagonal equals 100, so we need > thr or >= thr with j!=i
+            if (row[:i] >= thr).any() or (row[i+1:] >= thr).any():
+                hit_rows.add(i)
+        if hit_rows:
+            flags[sub.index[list(hit_rows)]] = True
+    return pd.Series(flags, index=prepped.index)
+
+def compute_project_flags_fast(
+    prepped: pd.DataFrame,
+    colmap: dict,
+    redundant_similarity=0.60,
+    ghost_high_amount_percentile=75,
+    never_ending_days=730,
+    cost_iqr_k=1.5
+) -> dict:
+    df = prepped.copy()
+    title_col   = colmap.get("title")
+    amount_col  = colmap.get("amount")
+    status_col  = colmap.get("status")
+    start_col   = colmap.get("start")
+    end_col     = colmap.get("end")
+
+    # Redundant (fast)
+    df["FLAG_RedundantSameAreaYear"] = _fast_redundant_flags(df, title_col, redundant_similarity)
 
     # Potential Ghost
     amt_hi = np.nanpercentile(df["__Amount"].dropna(), ghost_high_amount_percentile) if df["__Amount"].notna().any() else np.nan
-    flags_g = []; reasons_g = []
-    for _, r in df.iterrows():
-        status = str(r.get(status_col, "")).lower().strip() if status_col else ""
-        sd = r.get(start_col); ed = r.get(end_col); amt = r.get("__Amount")
-        flag=False; reasons=[]
-        if ("complete" in status) or ("100" in status):
-            if pd.isna(ed):
-                flag=True; reasons.append("Completed status but no completion date")
-            elif pd.notna(sd) and (ed - sd).days < 7 and pd.notna(amt) and pd.notna(amt_hi) and amt >= amt_hi:
-                flag=True; reasons.append("Very short completion for high-amount project")
-        if pd.notna(sd) and pd.isna(ed) and (pd.Timestamp.now() - sd).days > 730:
-            flag=True; reasons.append(">2 years elapsed without completion")
-        if pd.isna(sd) and pd.isna(ed) and pd.notna(amt) and pd.notna(amt_hi) and amt >= amt_hi:
-            flag=True; reasons.append("No dates recorded for high-amount project")
-        flags_g.append(flag); reasons_g.append("; ".join(reasons))
-    df["FLAG_PotentialGhost"] = flags_g
-    df["Reason_PotentialGhost"] = reasons_g
+    status_vals = df[status_col].astype(str).str.lower().str.strip() if status_col else pd.Series("", index=df.index)
+    completeish = status_vals.str.contains("complete") | status_vals.str.contains(r"\b100\b")
+    no_end = df[end_col].isna() if end_col else pd.Series(True, index=df.index)
+    very_short = (
+        (df[end_col] - df[start_col]).dt.days < 7
+        if start_col and end_col else pd.Series(False, index=df.index)
+    )
+    high_amt = (df["__Amount"] >= amt_hi) if np.isfinite(amt_hi) else pd.Series(False, index=df.index)
+    long_open = (
+        (pd.Timestamp.now() - df[start_col]).dt.days > 730
+        if start_col else pd.Series(False, index=df.index)
+    )
+    no_dates = (df[start_col].isna() if start_col else True) & (df[end_col].isna() if end_col else True)
+    ghost_flag = (
+        (completeish & no_end) |
+        (completeish & very_short & high_amt) |
+        (long_open & no_end) |
+        (no_dates & high_amt)
+    )
+    reasons = []
+    # Reasons are lightweight to compute; keep clarity
+    reasons.append(np.where(completeish & no_end, "Completed status but no completion date", ""))
+    reasons.append(np.where(completeish & very_short & high_amt, "Very short completion for high-amount project", ""))
+    reasons.append(np.where(long_open & no_end, ">2 years elapsed without completion", ""))
+    reasons.append(np.where(no_dates & high_amt, "No dates recorded for high-amount project", ""))
+    reason_col = pd.Series(["; ".join([r for r in row if r]) for row in zip(*reasons)], index=df.index)
+
+    df["FLAG_PotentialGhost"] = ghost_flag.fillna(False)
+    df["Reason_PotentialGhost"] = reason_col
 
     # Never-ending
-    flags_n=[]; reasons_n=[]
-    for _, r in df.iterrows():
-        flag=False; reasons=[]
-        dur = r["__DurationDays"]
-        if pd.notna(dur) and dur >= never_ending_days:
-            flag=True; reasons.append(f"Duration {int(dur)} days (>= {never_ending_days})")
-        if title_col:
-            sub = df[(df["__AreaKey"]==r["__AreaKey"]) & df[title_col].notna()]
-            years_hit=set()
-            for y, suby in sub.groupby("__Year"):
-                if pd.isna(y): continue
-                if suby[title_col].astype(str).apply(lambda t: seq_ratio(t, r[title_col])).max() >= redundant_similarity:
-                    years_hit.add(int(y))
-            if len(years_hit)>=3:
-                flag=True; reasons.append(f"Similar title across {len(years_hit)} years in same area")
-        flags_n.append(flag); reasons_n.append("; ".join(reasons))
-    df["FLAG_NeverEnding"] = flags_n
-    df["Reason_NeverEnding"] = reasons_n
+    dur_ok = df["__DurationDays"].fillna(-1)
+    df["FLAG_NeverEnding"] = dur_ok.ge(never_ending_days)
 
     # Costly (IQR)
-    def iqr_flags(s: pd.Series, k=1.5):
-        s = s.astype(float)
-        s2 = s[~s.isna()]
+    def iqr_bounds(s: pd.Series, k=1.5):
+        s2 = s.astype(float).replace([np.inf, -np.inf], np.nan).dropna()
         if s2.empty:
-            return pd.Series(False, index=s.index), np.nan, np.nan
+            return np.nan, np.nan
         q1, q3 = s2.quantile(0.25), s2.quantile(0.75)
-        iqr = q3-q1 if (q3-q1)>0 else (s2.std() if s2.std()>0 else 1.0)
-        low, high = q1 - k*iqr, q3 + k*iqr
-        flags = (s<low)|(s>high)
-        return flags.fillna(False), low, high
+        iqr = q3 - q1
+        if iqr <= 0:
+            # fallback to std if needed
+            std = s2.std()
+            iqr = std if std > 0 else 1.0
+        return (q1 - k*iqr, q3 + k*iqr)
 
-    metric = "__CostPerKm" if df["__CostPerKm"].notna().sum() >= df["__CostPerSqKm"].notna().sum() else "__CostPerSqKm"
-    flags_c, low_t, high_t = iqr_flags(df[metric], k=cost_iqr_k)
-    df["FLAG_Costly"] = flags_c
-    df["CostMetricUsed"] = metric
+    metric_name = "__CostPerKm" if df["__CostPerKm"].notna().sum() >= df["__CostPerSqKm"].notna().sum() else "__CostPerSqKm"
+    low_t, high_t = iqr_bounds(df[metric_name], k=cost_iqr_k)
+    costly = (df[metric_name] < low_t) | (df[metric_name] > high_t) if np.isfinite(low_t) and np.isfinite(high_t) else pd.Series(False, index=df.index)
+    df["FLAG_Costly"] = costly.fillna(False)
+    df["CostMetricUsed"] = metric_name
     df["CostOutlierLow"], df["CostOutlierHigh"] = low_t, high_t
 
     # Outputs
     flag_cols = ["FLAG_RedundantSameAreaYear","FLAG_PotentialGhost","FLAG_NeverEnding","FLAG_Costly"]
-    out["annotated_full"] = df.copy()
-    out["redundant"] = df[df["FLAG_RedundantSameAreaYear"]].copy()
-    out["ghost"] = df[df["FLAG_PotentialGhost"]].copy()
-    out["neverending"] = df[df["FLAG_NeverEnding"]].copy()
-    out["costly"] = df[df["FLAG_Costly"]].copy()
-    out["all_flagged"] = df[df[flag_cols].any(axis=1)].copy()
-
-    out["summary"] = pd.DataFrame({
-        "Flag": ["RedundantSameAreaYear","PotentialGhost","NeverEnding","Costly","AnyFlag"],
-        "Count": [len(out["redundant"]),len(out["ghost"]),len(out["neverending"]),len(out["costly"]),len(out["all_flagged"])]
-    })
+    out = {
+        "annotated_full": df.copy(),
+        "redundant": df[df["FLAG_RedundantSameAreaYear"]].copy(),
+        "ghost": df[df["FLAG_PotentialGhost"]].copy(),
+        "neverending": df[df["FLAG_NeverEnding"]].copy(),
+        "costly": df[df["FLAG_Costly"]].copy(),
+        "all_flagged": df[df[flag_cols].any(axis=1)].copy(),
+        "summary": pd.DataFrame({
+            "Flag": ["RedundantSameAreaYear","PotentialGhost","NeverEnding","Costly","AnyFlag"],
+            "Count": [
+                int(df["FLAG_RedundantSameAreaYear"].sum()),
+                int(df["FLAG_PotentialGhost"].sum()),
+                int(df["FLAG_NeverEnding"].sum()),
+                int(df["FLAG_Costly"].sum()),
+                int(df[flag_cols].any(axis=1).sum())
+            ]
+        })
+    }
     return out
